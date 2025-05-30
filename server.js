@@ -210,7 +210,7 @@ function generateCollectionHTML(products, collectionData) {
     `;
   }).join('');
 
-  // Complete HTML structure
+  // Complete HTML structure with fixed 2-column layout
   return `
     <div class="geo-results-static" data-generated="${new Date().toISOString()}" data-city="${escapeHtml(cityName)}">
       <div class="geo-results__inner">
@@ -230,13 +230,13 @@ function generateCollectionHTML(products, collectionData) {
     </div>
 
     <script>
-      // Apply masonry layout to static content
+      // Apply masonry layout to static content (fixed for 2 columns)
       document.addEventListener('DOMContentLoaded', function() {
         const grid = document.querySelector('.masonry-grid--static');
         if (!grid) return;
         
         const items = Array.from(grid.querySelectorAll('.masonry-item'));
-        const columnCount = window.innerWidth >= 750 ? 3 : 2;
+        const columnCount = window.innerWidth >= 750 ? 2 : 2; // Changed from 3 to 2
         
         function layoutStaticMasonry() {
           const containerWidth = grid.offsetWidth;
