@@ -14,146 +14,140 @@ app.use(express.json());
 const cache = new Map();
 const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
 
-// Import your existing deduplication functions
-function getLocationKey(product) {
-  const meta = product.meta || {};
-  const locationMeta = meta.location || {};
-  const details = locationMeta.details || {};
-  
-  if (details.latitude && details.longitude) {
-    return `${details.latitude.toFixed(6)},${details.longitude.toFixed(6)}`;
+// Remove old helper functions that are no longer needed
+// getLocationKey, getProductKey, areTitlesSimilar functions removed
+
+function deduplicateForCollection(hits, maxPerLocationPhoto = 2, targetProducts = 24) {
+  // Helper function to get location_photo from product
+  function getLocationPhoto(product) {
+    return product.meta?.location?.details?.location_photo || null;
   }
   
-  if (details.google_id) {
-    return `google_id:${details.google_id}`;
+  // Helper function to get style_name from product
+  function getStyleName(product) {
+    return product.meta?.location?.details?.style_name || null;
   }
   
-  if (details.formatted_address) {
-    return `address:${details.formatted_address}`;
-  }
-  
-  return `unique:${product.handle}`;
-}
-
-function getProductKey(product) {
-  const handle = product.handle || '';
-  let baseHandle = handle.split('-variant-')[0].split('-v-')[0];
-  baseHandle = baseHandle.replace(/-\d+x\d+/, '').replace(/-original-painting/, '').replace(/-print/, '');
-  return baseHandle;
-}
-
-function areTitlesSimilar(title1, title2, threshold = 0.8) {
-  if (!title1 || !title2) return false;
-  
-  const t1 = title1.toLowerCase().trim();
-  const t2 = title2.toLowerCase().trim();
-  
-  if (t1 === t2) return true;
-  
-  const words1 = t1.split(/\s+/);
-  const words2 = t2.split(/\s+/);
-  let commonWords = 0;
-  
-  words1.forEach(word => {
-    if (word.length > 2 && words2.includes(word)) {
-      commonWords++;
-    }
-  });
-  
-  const similarity = (commonWords * 2) / (words1.length + words2.length);
-  return similarity >= threshold;
-}
-
-function deduplicateForCollection(hits, maxPerLocation = 2, targetProducts = 24) {
-  // Step 1: Remove product duplicates
-  const seenProducts = {};
-  const uniqueProducts = [];
+  // Step 1: Group products by location_photo
+  const productsByPhoto = {};
+  const productsWithoutPhoto = [];
   
   hits.forEach(product => {
-    const productKey = getProductKey(product);
-    const title = product.title || '';
-    
-    if (seenProducts[productKey]) {
-      return;
+    const locationPhoto = getLocationPhoto(product);
+    if (locationPhoto) {
+      if (!productsByPhoto[locationPhoto]) {
+        productsByPhoto[locationPhoto] = [];
+      }
+      productsByPhoto[locationPhoto].push(product);
+    } else {
+      productsWithoutPhoto.push(product);
     }
-    
-    const isSimilarToExisting = uniqueProducts.some(existingProduct => 
-      areTitlesSimilar(title, existingProduct.title, 0.8)
-    );
-    
-    if (isSimilarToExisting) {
-      return;
-    }
-    
-    seenProducts[productKey] = true;
-    uniqueProducts.push(product);
   });
   
-  // Step 2: Apply location-based distribution  
-  const locationCounts = {};
+  // Step 2: Select max 2 products per location_photo
+  const selectedProducts = [];
+  
+  // Add products with location_photo (max 2 per photo)
+  Object.values(productsByPhoto).forEach(photoProducts => {
+    selectedProducts.push(...photoProducts.slice(0, maxPerLocationPhoto));
+  });
+  
+  // Add products without location_photo
+  selectedProducts.push(...productsWithoutPhoto);
+  
+  // Step 3: Shuffle products with same location_photo as far apart as possible
   const result = [];
-  const productsByLocation = {};
+  const photoGroups = {};
   
-  uniqueProducts.forEach(product => {
-    const locationKey = getLocationKey(product);
-    if (!productsByLocation[locationKey]) {
-      productsByLocation[locationKey] = [];
+  // Group selected products by location_photo for distribution
+  selectedProducts.forEach(product => {
+    const locationPhoto = getLocationPhoto(product);
+    const key = locationPhoto || 'no_photo';
+    if (!photoGroups[key]) {
+      photoGroups[key] = [];
     }
-    productsByLocation[locationKey].push(product);
+    photoGroups[key].push(product);
   });
   
-  let locationKeys = Object.keys(productsByLocation);
-  let locationIndex = 0;
-  const maxIterations = uniqueProducts.length * 2;
-  let iterations = 0;
+  // Distribute products to maximize distance between same location_photo
+  const photoKeys = Object.keys(photoGroups);
+  const photoCounters = {};
   
-  while (result.length < targetProducts && iterations < maxIterations && locationKeys.length > 0) {
-    iterations++;
-    let foundProduct = false;
+  // Initialize counters
+  photoKeys.forEach(key => {
+    photoCounters[key] = 0;
+  });
+  
+  while (result.length < targetProducts && result.length < selectedProducts.length) {
+    let addedProduct = false;
     
-    for (let i = 0; i < locationKeys.length && result.length < targetProducts; i++) {
-      const currentLocationIndex = (locationIndex + i) % locationKeys.length;
-      const locationKey = locationKeys[currentLocationIndex];
-      const productsAtLocation = productsByLocation[locationKey];
+    // Try to add one product from each photo group in round-robin fashion
+    for (const photoKey of photoKeys) {
+      if (result.length >= targetProducts) break;
       
-      if (!productsAtLocation || productsAtLocation.length === 0) {
-        continue;
-      }
+      const products = photoGroups[photoKey];
+      const counter = photoCounters[photoKey];
       
-      const currentCount = locationCounts[locationKey] || 0;
-      if (currentCount >= maxPerLocation) {
-        continue;
-      }
-      
-      let canPlace = true;
-      if (result.length > 0) {
-        const lastProduct = result[result.length - 1];
-        const lastLocationKey = getLocationKey(lastProduct);
-        if (lastLocationKey === locationKey) {
-          canPlace = false;
-        }
-      }
-      
-      if (canPlace) {
-        const product = productsAtLocation.shift();
-        result.push(product);
-        locationCounts[locationKey] = currentCount + 1;
-        foundProduct = true;
+      if (counter < products.length) {
+        const product = products[counter];
         
-        if (productsAtLocation.length === 0) {
-          delete productsByLocation[locationKey];
-          locationKeys = Object.keys(productsByLocation);
+        // Check style_name adjacency rule (less important)
+        let canAdd = true;
+        if (result.length > 0) {
+          const lastProduct = result[result.length - 1];
+          const lastStyleName = getStyleName(lastProduct);
+          const currentStyleName = getStyleName(product);
+          
+          if (lastStyleName && currentStyleName && lastStyleName === currentStyleName) {
+            // Try to find a different product that doesn't violate style rule
+            let alternativeFound = false;
+            for (const altPhotoKey of photoKeys) {
+              if (altPhotoKey === photoKey) continue;
+              
+              const altProducts = photoGroups[altPhotoKey];
+              const altCounter = photoCounters[altPhotoKey];
+              
+              if (altCounter < altProducts.length) {
+                const altProduct = altProducts[altCounter];
+                const altStyleName = getStyleName(altProduct);
+                
+                if (!altStyleName || altStyleName !== lastStyleName) {
+                  // Use alternative product instead
+                  result.push(altProduct);
+                  photoCounters[altPhotoKey]++;
+                  addedProduct = true;
+                  break;
+                }
+              }
+            }
+            
+            if (!alternativeFound) {
+              // No alternative found, add current product anyway
+              result.push(product);
+              photoCounters[photoKey]++;
+              addedProduct = true;
+            }
+          } else {
+            // No style conflict, add product
+            result.push(product);
+            photoCounters[photoKey]++;
+            addedProduct = true;
+          }
+        } else {
+          // First product, add without checks
+          result.push(product);
+          photoCounters[photoKey]++;
+          addedProduct = true;
         }
         
-        break;
+        break; // Move to next photo group
       }
     }
     
-    if (!foundProduct) {
+    if (!addedProduct) {
+      // No more products available in any group
       break;
     }
-    
-    locationIndex = (locationIndex + 1) % Math.max(1, locationKeys.length);
   }
   
   return result;
@@ -210,7 +204,7 @@ function generateCollectionHTML(products, collectionData) {
     `;
   }).join('');
 
-  // Complete HTML structure with fixed 2-column layout
+  // Complete HTML structure
   return `
     <div class="geo-results-static" data-generated="${new Date().toISOString()}" data-city="${escapeHtml(cityName)}">
       <div class="geo-results__inner">
@@ -230,13 +224,13 @@ function generateCollectionHTML(products, collectionData) {
     </div>
 
     <script>
-      // Apply masonry layout to static content (fixed for 2 columns)
+      // Apply masonry layout to static content
       document.addEventListener('DOMContentLoaded', function() {
         const grid = document.querySelector('.masonry-grid--static');
         if (!grid) return;
         
         const items = Array.from(grid.querySelectorAll('.masonry-item'));
-        const columnCount = window.innerWidth >= 750 ? 2 : 2; // Changed from 3 to 2
+        const columnCount = window.innerWidth >= 750 ? 3 : 2;
         
         function layoutStaticMasonry() {
           const containerWidth = grid.offsetWidth;
@@ -312,7 +306,7 @@ app.post('/api/nearby-search', async (req, res) => {
       radiusKm = 30, 
       hitsPerPage = 24, 
       currentHandle,
-      maxPerLocation = 2,
+      maxPerLocationPhoto = 2,
       fallback = false
     } = req.body;
 
@@ -329,7 +323,7 @@ app.post('/api/nearby-search', async (req, res) => {
     }
 
     // Create cache key
-    const cacheKey = `nearby:${lat || 'fallback'}:${lng || 'fallback'}:${radiusKm}:${hitsPerPage}:${maxPerLocation}`;
+    const cacheKey = `nearby:${lat || 'fallback'}:${lng || 'fallback'}:${radiusKm}:${hitsPerPage}:${maxPerLocationPhoto}`;
     
     // Check cache
     const cached = cache.get(cacheKey);
@@ -369,7 +363,7 @@ app.post('/api/nearby-search', async (req, res) => {
     }
 
     const searchResponse = await index.search('', searchParams);
-    const uniqueHits = deduplicateForCollection(searchResponse.hits, maxPerLocation, hitsPerPage);
+    const uniqueHits = deduplicateForCollection(searchResponse.hits, maxPerLocationPhoto, hitsPerPage);
 
     const response = {
       hits: uniqueHits,
