@@ -28,11 +28,37 @@ function deduplicateForCollection(hits, maxPerLocationPhoto = 2, targetProducts 
     return product.meta?.location?.details?.style_name || null;
   }
   
-  // Step 1: Group products by location_photo
+  // Helper function to get base product handle (removes variant suffixes)
+  function getBaseHandle(product) {
+    const handle = product.handle || '';
+    // Remove common variant patterns
+    return handle
+      .split('-variant-')[0]
+      .split('-v-')[0]
+      .replace(/-\d+x\d+$/, '')
+      .replace(/-original-painting$/, '')
+      .replace(/-print$/, '')
+      .replace(/-canvas$/, '')
+      .replace(/-paper$/, '');
+  }
+  
+  // Step 0: Remove variant duplicates first
+  const seenBaseHandles = new Set();
+  const uniqueProducts = [];
+  
+  hits.forEach(product => {
+    const baseHandle = getBaseHandle(product);
+    if (!seenBaseHandles.has(baseHandle)) {
+      seenBaseHandles.add(baseHandle);
+      uniqueProducts.push(product);
+    }
+  });
+  
+  // Step 1: Group unique products by location_photo
   const productsByPhoto = {};
   const productsWithoutPhoto = [];
   
-  hits.forEach(product => {
+  uniqueProducts.forEach(product => {
     const locationPhoto = getLocationPhoto(product);
     if (locationPhoto) {
       if (!productsByPhoto[locationPhoto]) {
@@ -78,7 +104,7 @@ function deduplicateForCollection(hits, maxPerLocationPhoto = 2, targetProducts 
     photoCounters[key] = 0;
   });
   
-  while (result.length < targetProducts && result.length < selectedProducts.length) {
+  while (result.length < targetProducts && result.length < uniqueProducts.length) {
     let addedProduct = false;
     
     // Try to add one product from each photo group in round-robin fashion
