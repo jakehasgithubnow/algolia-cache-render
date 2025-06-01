@@ -1,4 +1,4 @@
-// server.js - Express server for Render.com
+// server.js - Express server for Render.com with German locale support
 const express = require('express');
 const cors = require('cors');
 const algoliasearch = require('algoliasearch');
@@ -14,166 +14,153 @@ app.use(express.json());
 const cache = new Map();
 const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
 
-// Remove old helper functions that are no longer needed
-// getLocationKey, getProductKey, areTitlesSimilar functions removed
+// Multiple index support for different locales
+const ALGOLIA_INDEXES = {
+  'en': 'shopify_products',
+  'de': 'shopify_produkte',
+  'default': 'shopify_products'
+};
 
-function deduplicateForCollection(hits, maxPerLocationPhoto = 2, targetProducts = 24) {
-  // Helper function to get location_photo from product
-  function getLocationPhoto(product) {
-    return product.meta?.location?.details?.location_photo || null;
+// Import your existing deduplication functions
+function getLocationKey(product) {
+  const meta = product.meta || {};
+  const locationMeta = meta.location || {};
+  const details = locationMeta.details || {};
+  
+  if (details.latitude && details.longitude) {
+    return `${details.latitude.toFixed(6)},${details.longitude.toFixed(6)}`;
   }
   
-  // Helper function to get style_name from product
-  function getStyleName(product) {
-    return product.meta?.location?.details?.style_name || null;
+  if (details.google_id) {
+    return `google_id:${details.google_id}`;
   }
   
-  // Helper function to get base product handle (removes variant suffixes)
-  function getBaseHandle(product) {
-    const handle = product.handle || '';
-    // Remove common variant patterns
-    return handle
-      .split('-variant-')[0]
-      .split('-v-')[0]
-      .replace(/-\d+x\d+$/, '')
-      .replace(/-original-painting$/, '')
-      .replace(/-print$/, '')
-      .replace(/-canvas$/, '')
-      .replace(/-paper$/, '');
+  if (details.formatted_address) {
+    return `address:${details.formatted_address}`;
   }
   
-  // Step 0: Remove variant duplicates first
-  const seenBaseHandles = new Set();
+  return `unique:${product.handle}`;
+}
+
+function getProductKey(product) {
+  const handle = product.handle || '';
+  let baseHandle = handle.split('-variant-')[0].split('-v-')[0];
+  baseHandle = baseHandle.replace(/-\d+x\d+/, '').replace(/-original-painting/, '').replace(/-print/, '');
+  return baseHandle;
+}
+
+function areTitlesSimilar(title1, title2, threshold = 0.8) {
+  if (!title1 || !title2) return false;
+  
+  const t1 = title1.toLowerCase().trim();
+  const t2 = title2.toLowerCase().trim();
+  
+  if (t1 === t2) return true;
+  
+  const words1 = t1.split(/\s+/);
+  const words2 = t2.split(/\s+/);
+  let commonWords = 0;
+  
+  words1.forEach(word => {
+    if (word.length > 2 && words2.includes(word)) {
+      commonWords++;
+    }
+  });
+  
+  const similarity = (commonWords * 2) / (words1.length + words2.length);
+  return similarity >= threshold;
+}
+
+function deduplicateForCollection(hits, maxPerLocation = 2, targetProducts = 24) {
+  // Step 1: Remove product duplicates
+  const seenProducts = {};
   const uniqueProducts = [];
   
   hits.forEach(product => {
-    const baseHandle = getBaseHandle(product);
-    if (!seenBaseHandles.has(baseHandle)) {
-      seenBaseHandles.add(baseHandle);
-      uniqueProducts.push(product);
+    const productKey = getProductKey(product);
+    const title = product.title || '';
+    
+    if (seenProducts[productKey]) {
+      return;
     }
+    
+    const isSimilarToExisting = uniqueProducts.some(existingProduct => 
+      areTitlesSimilar(title, existingProduct.title, 0.8)
+    );
+    
+    if (isSimilarToExisting) {
+      return;
+    }
+    
+    seenProducts[productKey] = true;
+    uniqueProducts.push(product);
   });
   
-  // Step 1: Group unique products by location_photo
-  const productsByPhoto = {};
-  const productsWithoutPhoto = [];
+  // Step 2: Apply location-based distribution  
+  const locationCounts = {};
+  const result = [];
+  const productsByLocation = {};
   
   uniqueProducts.forEach(product => {
-    const locationPhoto = getLocationPhoto(product);
-    if (locationPhoto) {
-      if (!productsByPhoto[locationPhoto]) {
-        productsByPhoto[locationPhoto] = [];
-      }
-      productsByPhoto[locationPhoto].push(product);
-    } else {
-      productsWithoutPhoto.push(product);
+    const locationKey = getLocationKey(product);
+    if (!productsByLocation[locationKey]) {
+      productsByLocation[locationKey] = [];
     }
+    productsByLocation[locationKey].push(product);
   });
   
-  // Step 2: Select max 2 products per location_photo
-  const selectedProducts = [];
+  let locationKeys = Object.keys(productsByLocation);
+  let locationIndex = 0;
+  const maxIterations = uniqueProducts.length * 2;
+  let iterations = 0;
   
-  // Add products with location_photo (max 2 per photo)
-  Object.values(productsByPhoto).forEach(photoProducts => {
-    selectedProducts.push(...photoProducts.slice(0, maxPerLocationPhoto));
-  });
-  
-  // Add products without location_photo
-  selectedProducts.push(...productsWithoutPhoto);
-  
-  // Step 3: Shuffle products with same location_photo as far apart as possible
-  const result = [];
-  const photoGroups = {};
-  
-  // Group selected products by location_photo for distribution
-  selectedProducts.forEach(product => {
-    const locationPhoto = getLocationPhoto(product);
-    const key = locationPhoto || 'no_photo';
-    if (!photoGroups[key]) {
-      photoGroups[key] = [];
-    }
-    photoGroups[key].push(product);
-  });
-  
-  // Distribute products to maximize distance between same location_photo
-  const photoKeys = Object.keys(photoGroups);
-  const photoCounters = {};
-  
-  // Initialize counters
-  photoKeys.forEach(key => {
-    photoCounters[key] = 0;
-  });
-  
-  while (result.length < targetProducts && result.length < uniqueProducts.length) {
-    let addedProduct = false;
+  while (result.length < targetProducts && iterations < maxIterations && locationKeys.length > 0) {
+    iterations++;
+    let foundProduct = false;
     
-    // Try to add one product from each photo group in round-robin fashion
-    for (const photoKey of photoKeys) {
-      if (result.length >= targetProducts) break;
+    for (let i = 0; i < locationKeys.length && result.length < targetProducts; i++) {
+      const currentLocationIndex = (locationIndex + i) % locationKeys.length;
+      const locationKey = locationKeys[currentLocationIndex];
+      const productsAtLocation = productsByLocation[locationKey];
       
-      const products = photoGroups[photoKey];
-      const counter = photoCounters[photoKey];
+      if (!productsAtLocation || productsAtLocation.length === 0) {
+        continue;
+      }
       
-      if (counter < products.length) {
-        const product = products[counter];
+      const currentCount = locationCounts[locationKey] || 0;
+      if (currentCount >= maxPerLocation) {
+        continue;
+      }
+      
+      let canPlace = true;
+      if (result.length > 0) {
+        const lastProduct = result[result.length - 1];
+        const lastLocationKey = getLocationKey(lastProduct);
+        if (lastLocationKey === locationKey) {
+          canPlace = false;
+        }
+      }
+      
+      if (canPlace) {
+        const product = productsAtLocation.shift();
+        result.push(product);
+        locationCounts[locationKey] = currentCount + 1;
+        foundProduct = true;
         
-        // Check style_name adjacency rule (less important)
-        let canAdd = true;
-        if (result.length > 0) {
-          const lastProduct = result[result.length - 1];
-          const lastStyleName = getStyleName(lastProduct);
-          const currentStyleName = getStyleName(product);
-          
-          if (lastStyleName && currentStyleName && lastStyleName === currentStyleName) {
-            // Try to find a different product that doesn't violate style rule
-            let alternativeFound = false;
-            for (const altPhotoKey of photoKeys) {
-              if (altPhotoKey === photoKey) continue;
-              
-              const altProducts = photoGroups[altPhotoKey];
-              const altCounter = photoCounters[altPhotoKey];
-              
-              if (altCounter < altProducts.length) {
-                const altProduct = altProducts[altCounter];
-                const altStyleName = getStyleName(altProduct);
-                
-                if (!altStyleName || altStyleName !== lastStyleName) {
-                  // Use alternative product instead
-                  result.push(altProduct);
-                  photoCounters[altPhotoKey]++;
-                  addedProduct = true;
-                  break;
-                }
-              }
-            }
-            
-            if (!alternativeFound) {
-              // No alternative found, add current product anyway
-              result.push(product);
-              photoCounters[photoKey]++;
-              addedProduct = true;
-            }
-          } else {
-            // No style conflict, add product
-            result.push(product);
-            photoCounters[photoKey]++;
-            addedProduct = true;
-          }
-        } else {
-          // First product, add without checks
-          result.push(product);
-          photoCounters[photoKey]++;
-          addedProduct = true;
+        if (productsAtLocation.length === 0) {
+          delete productsByLocation[locationKey];
+          locationKeys = Object.keys(productsByLocation);
         }
         
-        break; // Move to next photo group
+        break;
       }
     }
     
-    if (!addedProduct) {
-      // No more products available in any group
+    if (!foundProduct) {
       break;
     }
+    
+    locationIndex = (locationIndex + 1) % Math.max(1, locationKeys.length);
   }
   
   return result;
@@ -302,13 +289,52 @@ function generateCollectionHTML(products, collectionData) {
   `;
 }
 
+// Helper function to get the correct index name
+function getIndexName(locale) {
+  const normalizedLocale = (locale || 'en').toLowerCase();
+  return ALGOLIA_INDEXES[normalizedLocale] || ALGOLIA_INDEXES.default;
+}
+
+// Helper function to try multiple indexes
+async function searchWithFallback(client, searchParams, locale) {
+  const primaryIndexName = getIndexName(locale);
+  const fallbackIndexName = ALGOLIA_INDEXES.default;
+  
+  console.log(`🔍 Trying primary index: ${primaryIndexName}`);
+  
+  try {
+    const primaryIndex = client.initIndex(primaryIndexName);
+    const response = await primaryIndex.search('', searchParams);
+    console.log(`✅ Primary index "${primaryIndexName}" worked`);
+    return response;
+  } catch (primaryError) {
+    console.log(`⚠️ Primary index "${primaryIndexName}" failed:`, primaryError.message);
+    
+    if (primaryIndexName !== fallbackIndexName) {
+      console.log(`🔄 Trying fallback index: ${fallbackIndexName}`);
+      try {
+        const fallbackIndex = client.initIndex(fallbackIndexName);
+        const response = await fallbackIndex.search('', searchParams);
+        console.log(`✅ Fallback index "${fallbackIndexName}" worked`);
+        return response;
+      } catch (fallbackError) {
+        console.log(`❌ Fallback index "${fallbackIndexName}" also failed:`, fallbackError.message);
+        throw fallbackError;
+      }
+    } else {
+      throw primaryError;
+    }
+  }
+}
+
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'algolia-cache-server',
     cache_size: cache.size,
-    uptime: process.uptime() + 's'
+    uptime: process.uptime() + 's',
+    supported_indexes: ALGOLIA_INDEXES
   });
 });
 
@@ -318,12 +344,13 @@ app.get('/cache-stats', (req, res) => {
     size: cache.size,
     keys: Array.from(cache.keys()),
     memory: process.memoryUsage(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    indexes: ALGOLIA_INDEXES
   };
   res.json(stats);
 });
 
-// Your existing nearby search endpoint
+// Your existing nearby search endpoint with multi-index support
 app.post('/api/nearby-search', async (req, res) => {
   try {
     const { 
@@ -332,24 +359,36 @@ app.post('/api/nearby-search', async (req, res) => {
       radiusKm = 30, 
       hitsPerPage = 24, 
       currentHandle,
-      maxPerLocationPhoto = 2,
-      fallback = false
+      maxPerLocation = 2,
+      fallback = false,
+      locale = 'en'
     } = req.body;
 
     console.log(`🌍 Nearby search:`, {
       location: lat && lng ? `${lat}, ${lng}` : 'fallback',
       radius: `${radiusKm}km`,
-      page: hitsPerPage
+      page: hitsPerPage,
+      locale: locale,
+      index: getIndexName(locale)
     });
 
     if (!fallback && (!lat || !lng)) {
       return res.status(400).json({
-        error: 'Missing required parameters: lat, lng (or set fallback: true)'
+        error: 'Missing required parameters: lat, lng (or set fallback: true)',
+        received: { lat, lng, fallback }
+      });
+    }
+
+    // Validate coordinates
+    if (!fallback && (isNaN(lat) || isNaN(lng))) {
+      return res.status(400).json({
+        error: 'Invalid coordinates: lat and lng must be valid numbers',
+        received: { lat, lng }
       });
     }
 
     // Create cache key
-    const cacheKey = `nearby:${lat || 'fallback'}:${lng || 'fallback'}:${radiusKm}:${hitsPerPage}:${maxPerLocationPhoto}`;
+    const cacheKey = `nearby:${lat || 'fallback'}:${lng || 'fallback'}:${radiusKm}:${hitsPerPage}:${maxPerLocation}:${locale}`;
     
     // Check cache
     const cached = cache.get(cacheKey);
@@ -371,8 +410,6 @@ app.post('/api/nearby-search', async (req, res) => {
       process.env.ALGOLIA_SEARCH_API_KEY || '2daede0d3abc6d559d4fbd37d763d544'
     );
 
-    const index = client.initIndex(process.env.ALGOLIA_INDEX_NAME || 'shopify_products');
-
     const searchParams = {
       hitsPerPage: hitsPerPage * 3,
       attributesToRetrieve: [
@@ -388,14 +425,15 @@ app.post('/api/nearby-search', async (req, res) => {
       searchParams.aroundRadius = radiusKm * 1000;
     }
 
-    const searchResponse = await index.search('', searchParams);
-    const uniqueHits = deduplicateForCollection(searchResponse.hits, maxPerLocationPhoto, hitsPerPage);
+    const searchResponse = await searchWithFallback(client, searchParams, locale);
+    const uniqueHits = deduplicateForCollection(searchResponse.hits, maxPerLocation, hitsPerPage);
 
     const response = {
       hits: uniqueHits,
       totalHits: searchResponse.nbHits,
       cached: false,
-      searchTime: searchResponse.processingTimeMS
+      searchTime: searchResponse.processingTimeMS,
+      indexUsed: getIndexName(locale)
     };
 
     // Cache the result
@@ -416,12 +454,13 @@ app.post('/api/nearby-search', async (req, res) => {
     console.error('❌ Nearby search error:', error);
     res.status(500).json({
       error: 'Search failed',
-      message: error.message
+      message: error.message,
+      indexAttempted: getIndexName(req.body.locale || 'en')
     });
   }
 });
 
-// Pre-generate collection endpoint
+// Pre-generate collection endpoint with multi-index support
 app.post('/api/pre-generate-collection', async (req, res) => {
   try {
     const { 
@@ -431,7 +470,8 @@ app.post('/api/pre-generate-collection', async (req, res) => {
       cityName,
       collectionHandle,
       hitsPerPage = 24,
-      forceRegenerate = false
+      forceRegenerate = false,
+      locale = 'en'
     } = req.body;
 
     if (!lat || !lng || !cityName) {
@@ -444,11 +484,13 @@ app.post('/api/pre-generate-collection', async (req, res) => {
       city: cityName,
       location: `${lat}, ${lng}`,
       radius: `${radiusKm}km`,
-      handle: collectionHandle
+      handle: collectionHandle,
+      locale: locale,
+      index: getIndexName(locale)
     });
 
     // Create cache key
-    const cacheKey = `static-collection:${cityName}:${lat}:${lng}:${radiusKm}:${hitsPerPage}`;
+    const cacheKey = `static-collection:${cityName}:${lat}:${lng}:${radiusKm}:${hitsPerPage}:${locale}`;
     
     // Check cache unless force regenerate
     if (!forceRegenerate) {
@@ -473,8 +515,6 @@ app.post('/api/pre-generate-collection', async (req, res) => {
       process.env.ALGOLIA_SEARCH_API_KEY || '2daede0d3abc6d559d4fbd37d763d544'
     );
 
-    const index = client.initIndex(process.env.ALGOLIA_INDEX_NAME || 'shopify_products');
-
     const searchParams = {
       aroundLatLng: `${lat},${lng}`,
       aroundRadius: radiusKm * 1000,
@@ -486,7 +526,7 @@ app.post('/api/pre-generate-collection', async (req, res) => {
       getRankingInfo: true
     };
 
-    const searchResponse = await index.search('', searchParams);
+    const searchResponse = await searchWithFallback(client, searchParams, locale);
     const deduplicatedHits = deduplicateForCollection(searchResponse.hits, 2, hitsPerPage);
 
     const collectionData = { cityName, totalHits: searchResponse.nbHits, lat, lng, radiusKm };
@@ -506,7 +546,8 @@ app.post('/api/pre-generate-collection', async (req, res) => {
     console.log(`✅ Static HTML generated for ${cityName}:`, {
       products: deduplicatedHits.length,
       htmlSize: `${Math.round(staticHTML.length / 1024)}KB`,
-      processingTime: `${searchResponse.processingTimeMS}ms`
+      processingTime: `${searchResponse.processingTimeMS}ms`,
+      indexUsed: getIndexName(locale)
     });
 
     res.json({
@@ -517,7 +558,8 @@ app.post('/api/pre-generate-collection', async (req, res) => {
         products: deduplicatedHits.length,
         totalHits: searchResponse.nbHits,
         city: cityName,
-        searchTime: searchResponse.processingTimeMS
+        searchTime: searchResponse.processingTimeMS,
+        indexUsed: getIndexName(locale)
       }
     });
 
@@ -525,7 +567,8 @@ app.post('/api/pre-generate-collection', async (req, res) => {
     console.error('❌ Pre-generation error:', error);
     res.status(500).json({
       error: 'Pre-generation failed',
-      message: error.message
+      message: error.message,
+      indexAttempted: getIndexName(req.body.locale || 'en')
     });
   }
 });
@@ -534,6 +577,7 @@ app.post('/api/pre-generate-collection', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Algolia cache server running on port ${PORT}`);
   console.log(`📊 Cache initialized - persistent storage enabled`);
+  console.log(`🌍 Supported indexes:`, ALGOLIA_INDEXES);
 });
 
 module.exports = app;
