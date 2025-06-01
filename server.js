@@ -222,11 +222,6 @@ function generateCollectionHTML(products, collectionData) {
     <div class="geo-results-static" data-generated="${new Date().toISOString()}" data-city="${escapeHtml(cityName)}">
       <div class="geo-results__inner">
         <div class="geo-results__meta">
-          <p class="geo-results__count">
-            Showing ${products.length} ${products.length === 1 ? 'artwork' : 'artworks'} 
-            from ${escapeHtml(cityName)} and nearby areas
-            ${totalHits > products.length ? ` (${totalHits - products.length} more available)` : ''}
-          </p>
         </div>
         <div class="geo-results__grid">
           <div class="masonry-grid masonry-grid--static">
