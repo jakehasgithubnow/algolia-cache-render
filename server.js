@@ -326,8 +326,8 @@ function generateSSRCollectionHTML(products, collectionData) {
 
   const optimizeImageUrl = (imageUrl) => {
     if (imageUrl && imageUrl.includes('cdn.shopify.com')) {
-      // Use _400x instead of _600x for better size match to display dimensions
-      return imageUrl.replace(/\.webp(\?.*)?$/i, '_400x.webp$1');
+      // Use _500x instead of _600x for better size match to display dimensions
+      return imageUrl.replace(/\.webp(\?.*)?$/i, '_500x.webp$1');
     }
     return imageUrl;
   };
@@ -347,7 +347,7 @@ function generateSSRCollectionHTML(products, collectionData) {
     const shouldLazyLoad = index >= 2;
     
     // Use responsive dimensions that work on all screen sizes
-    const displayWidth = 400; // Reasonable default that fits mobile and desktop
+    const displayWidth = 500; // Reasonable default that fits mobile and desktop
     const displayHeight = Math.round(displayWidth * 0.75); // 4:3 aspect ratio
 
     return `
@@ -454,7 +454,7 @@ app.post('/api/nearby-search', async (req, res) => {
     });
 
     if (!fallback && (!lat || !lng)) {
-      return res.status(400).json({
+      return res.status(500).json({
         error: 'Missing required parameters: lat, lng (or set fallback: true)'
       });
     }
