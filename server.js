@@ -326,7 +326,8 @@ function generateSSRCollectionHTML(products, collectionData) {
 
   const optimizeImageUrl = (imageUrl) => {
     if (imageUrl && imageUrl.includes('cdn.shopify.com')) {
-      return imageUrl.replace(/\.webp(\?.*)?$/i, '_600x.webp$1');
+      // Use _400x instead of _600x for better size match to display dimensions
+      return imageUrl.replace(/\.webp(\?.*)?$/i, '_400x.webp$1');
     }
     return imageUrl;
   };
@@ -344,8 +345,10 @@ function generateSSRCollectionHTML(products, collectionData) {
     
     // First 2 images should not be lazy loaded for LCP
     const shouldLazyLoad = index >= 2;
-    const imageWidth = 600;
-    const imageHeight = 450;
+    
+    // Calculate proper dimensions for display
+    const displayWidth = 420; // Actual display width based on Lighthouse data
+    const displayHeight = Math.round(displayWidth * 0.75); // 4:3 aspect ratio
 
     return `
       <div class="masonry-item" data-location-photo="${product.meta?.location?.details?.location_photo || 'no-photo'}">
@@ -353,13 +356,13 @@ function generateSSRCollectionHTML(products, collectionData) {
           <div class="card card--standard card--media">
             <a href="/products/${product.handle}" class="full-unstyled-link">
               ${optimizedImageUrl ? `
-                <div class="card__media" style="aspect-ratio: ${imageWidth}/${imageHeight};">
+                <div class="card__media" style="aspect-ratio: 4/3; min-height: ${displayHeight}px;">
                   <img 
                     src="${optimizedImageUrl}" 
                     alt="${escapeHtml(product.title)}" 
                     ${shouldLazyLoad ? 'loading="lazy"' : ''}
-                    width="${imageWidth}"
-                    height="${imageHeight}"
+                    width="${displayWidth}"
+                    height="${displayHeight}"
                     style="width: 100%; height: 100%; object-fit: cover; display: block;"
                     ${index === 0 ? 'fetchpriority="high"' : ''}
                   >
