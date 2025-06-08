@@ -346,8 +346,8 @@ function generateSSRCollectionHTML(products, collectionData) {
     // First 2 images should not be lazy loaded for LCP
     const shouldLazyLoad = index >= 2;
     
-    // Calculate proper dimensions for display
-    const displayWidth = 420; // Actual display width based on Lighthouse data
+    // Use responsive dimensions that work on all screen sizes
+    const displayWidth = 400; // Reasonable default that fits mobile and desktop
     const displayHeight = Math.round(displayWidth * 0.75); // 4:3 aspect ratio
 
     return `
@@ -356,14 +356,14 @@ function generateSSRCollectionHTML(products, collectionData) {
           <div class="card card--standard card--media">
             <a href="/products/${product.handle}" class="full-unstyled-link">
               ${optimizedImageUrl ? `
-                <div class="card__media" style="aspect-ratio: 4/3; min-height: ${displayHeight}px;">
+                <div class="card__media" style="aspect-ratio: 4/3;">
                   <img 
                     src="${optimizedImageUrl}" 
                     alt="${escapeHtml(product.title)}" 
                     ${shouldLazyLoad ? 'loading="lazy"' : ''}
                     width="${displayWidth}"
                     height="${displayHeight}"
-                    style="width: 100%; height: 100%; object-fit: cover; display: block;"
+                    style="width: 100%; height: auto; max-width: 100%; object-fit: cover; display: block;"
                     ${index === 0 ? 'fetchpriority="high"' : ''}
                   >
                 </div>
