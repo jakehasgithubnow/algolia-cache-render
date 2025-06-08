@@ -1,4 +1,4 @@
-// server.js - Express server for Render.com with German locale support
+// server.js - Express server for Render.com with SSR Pre-rendering
 const express = require('express');
 const cors = require('cors');
 const algoliasearch = require('algoliasearch');
@@ -13,13 +13,6 @@ app.use(express.json());
 // In-memory cache that persists (unlike Vercel serverless)
 const cache = new Map();
 const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
-
-// Multiple index support for different locales
-const ALGOLIA_INDEXES = {
-  'en': 'shopify_products',
-  'de': 'shopify_produkte',
-  'default': 'shopify_products'
-};
 
 // Import your existing deduplication functions
 function getLocationKey(product) {
@@ -71,6 +64,7 @@ function areTitlesSimilar(title1, title2, threshold = 0.8) {
   return similarity >= threshold;
 }
 
+// Original deduplication function (keep for backward compatibility)
 function deduplicateForCollection(hits, maxPerLocation = 2, targetProducts = 24) {
   // Step 1: Remove product duplicates
   const seenProducts = {};
@@ -166,14 +160,158 @@ function deduplicateForCollection(hits, maxPerLocation = 2, targetProducts = 24)
   return result;
 }
 
-// Generate static HTML for a collection
-function generateCollectionHTML(products, collectionData) {
-  const { cityName, totalHits, lat, lng, radiusKm } = collectionData;
+// Server-side location photo deduplication with featured priority
+function deduplicateByLocationPhotoServer(hits, maxResults, maxPerPhoto) {
+  console.log('🎯 Server-side location photo deduplication:', {
+    inputHits: hits.length,
+    maxResults: maxResults,
+    maxPerPhoto: maxPerPhoto
+  });
+
+  // Helper functions
+  function getLocationPhoto(product) {
+    return product.meta?.location?.details?.location_photo || null;
+  }
+  
+  function getBaseHandle(product) {
+    const handle = product.handle || '';
+    return handle
+      .split('-variant-')[0]
+      .split('-v-')[0]
+      .replace(/-\d+x\d+$/, '')
+      .replace(/-original-painting$/, '')
+      .replace(/-print$/, '')
+      .replace(/-canvas$/, '')
+      .replace(/-paper$/, '');
+  }
+
+  function isFeatured(product) {
+    return product.meta?.featured === 'yes';
+  }
+
+  // Step 1: Remove product variants
+  const seenBaseHandles = {};
+  const uniqueProducts = [];
+  
+  hits.forEach(function(product) {
+    const baseHandle = getBaseHandle(product);
+    if (!seenBaseHandles[baseHandle]) {
+      seenBaseHandles[baseHandle] = true;
+      uniqueProducts.push(product);
+    }
+  });
+
+  console.log('📦 After variant deduplication:', uniqueProducts.length);
+
+  // Step 2: Separate featured and regular products
+  const featuredProducts = uniqueProducts.filter(isFeatured);
+  const regularProducts = uniqueProducts.filter(p => !isFeatured(p));
+
+  console.log('⭐ Featured vs Regular split:', {
+    featured: featuredProducts.length,
+    regular: regularProducts.length
+  });
+
+  // Step 3: Group by location photo
+  function groupByLocationPhoto(products) {
+    const productsByPhoto = {};
+    const productsWithoutPhoto = [];
+    
+    products.forEach(function(product) {
+      const locationPhoto = getLocationPhoto(product);
+      if (locationPhoto) {
+        if (!productsByPhoto[locationPhoto]) {
+          productsByPhoto[locationPhoto] = [];
+        }
+        productsByPhoto[locationPhoto].push(product);
+      } else {
+        productsWithoutPhoto.push(product);
+      }
+    });
+    
+    return { productsByPhoto, productsWithoutPhoto };
+  }
+
+  const featuredGroups = groupByLocationPhoto(featuredProducts);
+  const regularGroups = groupByLocationPhoto(regularProducts);
+
+  // Step 4: Create distribution queues
+  function createDistributionQueue(productsByPhoto, maxRounds) {
+    const distributionQueue = [];
+    const photoUUIDs = Object.keys(productsByPhoto);
+    
+    for (let round = 0; round < maxRounds; round++) {
+      photoUUIDs.forEach(function(uuid) {
+        if (productsByPhoto[uuid].length > round) {
+          distributionQueue.push({
+            uuid: uuid,
+            product: productsByPhoto[uuid][round],
+            round: round,
+            featured: isFeatured(productsByPhoto[uuid][round])
+          });
+        }
+      });
+    }
+    
+    return distributionQueue;
+  }
+
+  const featuredQueue = createDistributionQueue(featuredGroups.productsByPhoto, maxPerPhoto);
+  const regularQueue = createDistributionQueue(regularGroups.productsByPhoto, maxPerPhoto);
+
+  // Step 5: Distribute products (featured first)
+  const result = [];
+  const photoCounters = {};
+
+  // Featured products first
+  while (result.length < maxResults && featuredQueue.length > 0) {
+    const nextItem = featuredQueue.shift();
+    const currentCount = photoCounters[nextItem.uuid] || 0;
+    
+    if (currentCount < maxPerPhoto) {
+      result.push(nextItem.product);
+      photoCounters[nextItem.uuid] = currentCount + 1;
+    }
+  }
+
+  // Regular products fill remaining slots
+  while (result.length < maxResults && regularQueue.length > 0) {
+    const nextItem = regularQueue.shift();
+    const currentCount = photoCounters[nextItem.uuid] || 0;
+    
+    if (currentCount < maxPerPhoto) {
+      result.push(nextItem.product);
+      photoCounters[nextItem.uuid] = currentCount + 1;
+    }
+  }
+
+  // Add products without location photo
+  const remainingSlots = maxResults - result.length;
+  if (remainingSlots > 0) {
+    const allProductsWithoutPhoto = featuredGroups.productsWithoutPhoto.concat(regularGroups.productsWithoutPhoto);
+    const productsToAdd = allProductsWithoutPhoto.slice(0, remainingSlots);
+    result.push(...productsToAdd);
+  }
+
+  console.log('✅ Server-side deduplication complete:', {
+    totalProducts: result.length,
+    featuredCount: result.filter(isFeatured).length,
+    regularCount: result.filter(p => !isFeatured(p)).length
+  });
+
+  return result;
+}
+
+// Generate SSR HTML for fast LCP
+function generateSSRCollectionHTML(products, collectionData) {
+  const { cityName, totalHits, lat, lng, radiusKm, collectionHandle } = collectionData;
   
   const formatPrice = (price) => {
     return new Intl.NumberFormat('de-DE', {
       style: 'currency',
-      currency: 'EUR'
+      currency: 'EUR',
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0
     }).format(price);
   };
 
@@ -186,29 +324,50 @@ function generateCollectionHTML(products, collectionData) {
       .replace(/'/g, '&#39;');
   };
 
-  // Generate product grid HTML
-  const productsHTML = products.map(product => {
-    const imageUrl = product.product_image || product.image || '';
-    const price = product.price ? formatPrice(product.price) : '';
+  const optimizeImageUrl = (imageUrl) => {
+    if (imageUrl && imageUrl.includes('cdn.shopify.com')) {
+      return imageUrl.replace(/\.webp(\?.*)?$/i, '_600x.webp$1');
+    }
+    return imageUrl;
+  };
+
+  const formatProductPricing = (product) => {
+    const printPrice = product.variants_min_price || 7;
+    return `**Drucke ab ${formatPrice(printPrice)}, Originale ab ${formatPrice(50)}**`;
+  };
+
+  // Generate product cards HTML
+  const productsHTML = products.map((product, index) => {
+    const originalImageUrl = product.product_image || product.image || '';
+    const optimizedImageUrl = optimizeImageUrl(originalImageUrl);
+    const priceDisplay = formatProductPricing(product);
+    
+    // First 2 images should not be lazy loaded for LCP
+    const shouldLazyLoad = index >= 2;
+    const imageWidth = 600;
+    const imageHeight = 450;
 
     return `
-      <div class="masonry-item">
+      <div class="masonry-item" data-location-photo="${product.meta?.location?.details?.location_photo || 'no-photo'}">
         <div class="card-wrapper product-card-wrapper">
           <div class="card card--standard card--media">
             <a href="/products/${product.handle}" class="full-unstyled-link">
-              ${imageUrl ? `
-                <div class="card__media">
+              ${optimizedImageUrl ? `
+                <div class="card__media" style="aspect-ratio: ${imageWidth}/${imageHeight};">
                   <img 
-                    src="${imageUrl}" 
+                    src="${optimizedImageUrl}" 
                     alt="${escapeHtml(product.title)}" 
-                    loading="lazy" 
-                    style="width: 100%; height: auto; max-height: 400px; object-fit: cover; display: block;"
+                    ${shouldLazyLoad ? 'loading="lazy"' : ''}
+                    width="${imageWidth}"
+                    height="${imageHeight}"
+                    style="width: 100%; height: 100%; object-fit: cover; display: block;"
+                    ${index === 0 ? 'fetchpriority="high"' : ''}
                   >
                 </div>
               ` : ''}
               <div class="card__content">
                 <h3 class="card__heading">${escapeHtml(product.title)}</h3>
-                ${price ? `<div class="price">${price}</div>` : ''}
+                ${priceDisplay ? `<div class="price">${priceDisplay}</div>` : ''}
               </div>
             </a>
           </div>
@@ -217,109 +376,38 @@ function generateCollectionHTML(products, collectionData) {
     `;
   }).join('');
 
-  // Complete HTML structure
+  // Complete SSR HTML structure
   return `
-    <div class="geo-results-static" data-generated="${new Date().toISOString()}" data-city="${escapeHtml(cityName)}">
-      <div class="geo-results__inner">
-        <div class="geo-results__meta">
-        </div>
-        <div class="geo-results__grid">
-          <div class="masonry-grid masonry-grid--static">
+    <div class="ssr-geo-results" data-generated="${new Date().toISOString()}" data-city="${escapeHtml(cityName)}">
+      <div class="ssr-geo-results__inner">
+        <div class="ssr-geo-results__grid">
+          <div class="masonry-grid">
             ${productsHTML}
           </div>
+        </div>
+        <div class="ssr-loading-more" style="text-align: center; padding: 2rem 0; opacity: 0.7;">
+          <p>Loading more artwork...</p>
         </div>
       </div>
     </div>
 
     <script>
-      // Apply masonry layout to static content
+      // Mark SSR content as loaded
+      console.log('🚀 SSR content rendered for ${escapeHtml(cityName)} - LCP should be fast!');
+      
+      // Add basic event listeners for product links
       document.addEventListener('DOMContentLoaded', function() {
-        const grid = document.querySelector('.masonry-grid--static');
-        if (!grid) return;
-        
-        const items = Array.from(grid.querySelectorAll('.masonry-item'));
-        const columnCount = window.innerWidth >= 750 ? 3 : 2;
-        
-        function layoutStaticMasonry() {
-          const containerWidth = grid.offsetWidth;
-          const columnWidth = (containerWidth - (columnCount - 1) * 30) / columnCount;
-          const columns = new Array(columnCount).fill(0);
-          
-          items.forEach((item, index) => {
-            const shortestColumn = columns.indexOf(Math.min(...columns));
-            
-            item.style.position = 'absolute';
-            item.style.left = (shortestColumn * (columnWidth + 30)) + 'px';
-            item.style.top = columns[shortestColumn] + 'px';
-            item.style.width = columnWidth + 'px';
-            
-            columns[shortestColumn] += item.offsetHeight + 30;
+        const ssrContent = document.querySelector('.ssr-geo-results');
+        if (ssrContent) {
+          console.log('✅ SSR content initialized:', {
+            products: ssrContent.querySelectorAll('.masonry-item').length,
+            city: '${escapeHtml(cityName)}',
+            generated: ssrContent.dataset.generated
           });
-          
-          grid.style.height = Math.max(...columns) + 'px';
-          grid.style.position = 'relative';
         }
-        
-        Promise.all(
-          Array.from(grid.querySelectorAll('img')).map(img => {
-            return new Promise(resolve => {
-              if (img.complete) resolve();
-              else {
-                img.onload = resolve;
-                img.onerror = resolve;
-              }
-            });
-          })
-        ).then(() => {
-          layoutStaticMasonry();
-        });
-        
-        let resizeTimeout;
-        window.addEventListener('resize', () => {
-          clearTimeout(resizeTimeout);
-          resizeTimeout = setTimeout(layoutStaticMasonry, 250);
-        });
       });
     </script>
   `;
-}
-
-// Helper function to get the correct index name
-function getIndexName(locale) {
-  const normalizedLocale = (locale || 'en').toLowerCase();
-  return ALGOLIA_INDEXES[normalizedLocale] || ALGOLIA_INDEXES.default;
-}
-
-// Helper function to try multiple indexes
-async function searchWithFallback(client, searchParams, locale) {
-  const primaryIndexName = getIndexName(locale);
-  const fallbackIndexName = ALGOLIA_INDEXES.default;
-  
-  console.log(`🔍 Trying primary index: ${primaryIndexName}`);
-  
-  try {
-    const primaryIndex = client.initIndex(primaryIndexName);
-    const response = await primaryIndex.search('', searchParams);
-    console.log(`✅ Primary index "${primaryIndexName}" worked`);
-    return response;
-  } catch (primaryError) {
-    console.log(`⚠️ Primary index "${primaryIndexName}" failed:`, primaryError.message);
-    
-    if (primaryIndexName !== fallbackIndexName) {
-      console.log(`🔄 Trying fallback index: ${fallbackIndexName}`);
-      try {
-        const fallbackIndex = client.initIndex(fallbackIndexName);
-        const response = await fallbackIndex.search('', searchParams);
-        console.log(`✅ Fallback index "${fallbackIndexName}" worked`);
-        return response;
-      } catch (fallbackError) {
-        console.log(`❌ Fallback index "${fallbackIndexName}" also failed:`, fallbackError.message);
-        throw fallbackError;
-      }
-    } else {
-      throw primaryError;
-    }
-  }
 }
 
 // Health check endpoint
@@ -328,8 +416,7 @@ app.get('/', (req, res) => {
     status: 'ok', 
     service: 'algolia-cache-server',
     cache_size: cache.size,
-    uptime: process.uptime() + 's',
-    supported_indexes: ALGOLIA_INDEXES
+    uptime: process.uptime() + 's'
   });
 });
 
@@ -339,13 +426,12 @@ app.get('/cache-stats', (req, res) => {
     size: cache.size,
     keys: Array.from(cache.keys()),
     memory: process.memoryUsage(),
-    uptime: process.uptime(),
-    indexes: ALGOLIA_INDEXES
+    uptime: process.uptime()
   };
   res.json(stats);
 });
 
-// Your existing nearby search endpoint with multi-index support
+// Your existing nearby search endpoint
 app.post('/api/nearby-search', async (req, res) => {
   try {
     const { 
@@ -355,35 +441,23 @@ app.post('/api/nearby-search', async (req, res) => {
       hitsPerPage = 24, 
       currentHandle,
       maxPerLocation = 2,
-      fallback = false,
-      locale = 'en'
+      fallback = false
     } = req.body;
 
     console.log(`🌍 Nearby search:`, {
       location: lat && lng ? `${lat}, ${lng}` : 'fallback',
       radius: `${radiusKm}km`,
-      page: hitsPerPage,
-      locale: locale,
-      index: getIndexName(locale)
+      page: hitsPerPage
     });
 
     if (!fallback && (!lat || !lng)) {
       return res.status(400).json({
-        error: 'Missing required parameters: lat, lng (or set fallback: true)',
-        received: { lat, lng, fallback }
-      });
-    }
-
-    // Validate coordinates
-    if (!fallback && (isNaN(lat) || isNaN(lng))) {
-      return res.status(400).json({
-        error: 'Invalid coordinates: lat and lng must be valid numbers',
-        received: { lat, lng }
+        error: 'Missing required parameters: lat, lng (or set fallback: true)'
       });
     }
 
     // Create cache key
-    const cacheKey = `nearby:${lat || 'fallback'}:${lng || 'fallback'}:${radiusKm}:${hitsPerPage}:${maxPerLocation}:${locale}`;
+    const cacheKey = `nearby:${lat || 'fallback'}:${lng || 'fallback'}:${radiusKm}:${hitsPerPage}:${maxPerLocation}`;
     
     // Check cache
     const cached = cache.get(cacheKey);
@@ -405,6 +479,8 @@ app.post('/api/nearby-search', async (req, res) => {
       process.env.ALGOLIA_SEARCH_API_KEY || '2daede0d3abc6d559d4fbd37d763d544'
     );
 
+    const index = client.initIndex(process.env.ALGOLIA_INDEX_NAME || 'shopify_products');
+
     const searchParams = {
       hitsPerPage: hitsPerPage * 3,
       attributesToRetrieve: [
@@ -420,15 +496,14 @@ app.post('/api/nearby-search', async (req, res) => {
       searchParams.aroundRadius = radiusKm * 1000;
     }
 
-    const searchResponse = await searchWithFallback(client, searchParams, locale);
+    const searchResponse = await index.search('', searchParams);
     const uniqueHits = deduplicateForCollection(searchResponse.hits, maxPerLocation, hitsPerPage);
 
     const response = {
       hits: uniqueHits,
       totalHits: searchResponse.nbHits,
       cached: false,
-      searchTime: searchResponse.processingTimeMS,
-      indexUsed: getIndexName(locale)
+      searchTime: searchResponse.processingTimeMS
     };
 
     // Cache the result
@@ -449,13 +524,12 @@ app.post('/api/nearby-search', async (req, res) => {
     console.error('❌ Nearby search error:', error);
     res.status(500).json({
       error: 'Search failed',
-      message: error.message,
-      indexAttempted: getIndexName(req.body.locale || 'en')
+      message: error.message
     });
   }
 });
 
-// Pre-generate collection endpoint with multi-index support
+// Pre-generate collection endpoint with location photo deduplication and SSR
 app.post('/api/pre-generate-collection', async (req, res) => {
   try {
     const { 
@@ -464,9 +538,8 @@ app.post('/api/pre-generate-collection', async (req, res) => {
       radiusKm = 30, 
       cityName,
       collectionHandle,
-      hitsPerPage = 24,
-      forceRegenerate = false,
-      locale = 'en'
+      hitsPerPage = 6, // Fewer for LCP optimization
+      forceRegenerate = false
     } = req.body;
 
     if (!lat || !lng || !cityName) {
@@ -475,95 +548,103 @@ app.post('/api/pre-generate-collection', async (req, res) => {
       });
     }
 
-    console.log(`🏗️ Pre-generating collection:`, {
+    console.log(`🏗️ Pre-generating collection with location photo dedup:`, {
       city: cityName,
       location: `${lat}, ${lng}`,
       radius: `${radiusKm}km`,
       handle: collectionHandle,
-      locale: locale,
-      index: getIndexName(locale)
+      maxProducts: hitsPerPage
     });
 
     // Create cache key
-    const cacheKey = `static-collection:${cityName}:${lat}:${lng}:${radiusKm}:${hitsPerPage}:${locale}`;
+    const cacheKey = `ssr-collection:${cityName}:${lat}:${lng}:${radiusKm}:${hitsPerPage}`;
     
     // Check cache unless force regenerate
     if (!forceRegenerate) {
       const cached = cache.get(cacheKey);
       if (cached && (Date.now() - cached.timestamp) < CACHE_DURATION) {
         const cacheAge = Math.round((Date.now() - cached.timestamp) / (1000 * 60 * 60));
-        console.log(`✅ Returning cached static HTML - Age: ${cacheAge} hours`);
+        console.log(`✅ Returning cached SSR HTML - Age: ${cacheAge} hours`);
         
         return res.json({
           html: cached.data,
           cached: true,
           cacheAge: cacheAge + 'h',
-          generated: cached.generated
+          generated: cached.generated,
+          stats: cached.stats
         });
       }
     }
 
-    console.log(`🔍 Generating new static HTML for ${cityName}`);
+    console.log(`🔍 Generating new SSR HTML for ${cityName}`);
 
     const client = algoliasearch(
       process.env.ALGOLIA_APP_ID || '9DAT2FR7L3',
       process.env.ALGOLIA_SEARCH_API_KEY || '2daede0d3abc6d559d4fbd37d763d544'
     );
 
+    const index = client.initIndex(process.env.ALGOLIA_INDEX_NAME || 'shopify_products');
+
     const searchParams = {
       aroundLatLng: `${lat},${lng}`,
       aroundRadius: radiusKm * 1000,
-      hitsPerPage: 100,
+      hitsPerPage: 100, // Get more for better deduplication
       attributesToRetrieve: [
         'title', 'handle', 'product_image', 'image', 'price', 
-        'vendor', '_geoloc', 'meta.location.details'
+        'vendor', '_geoloc', 'meta.location.details', 'variants_min_price', 'meta.featured'
       ],
       getRankingInfo: true
     };
 
-    const searchResponse = await searchWithFallback(client, searchParams, locale);
-    const deduplicatedHits = deduplicateForCollection(searchResponse.hits, 2, hitsPerPage);
+    const searchResponse = await index.search('', searchParams);
+    
+    // Apply location photo deduplication (max 2 per photo)
+    const deduplicatedHits = deduplicateByLocationPhotoServer(searchResponse.hits, hitsPerPage, 2);
 
-    const collectionData = { cityName, totalHits: searchResponse.nbHits, lat, lng, radiusKm };
-    const staticHTML = generateCollectionHTML(deduplicatedHits, collectionData);
+    const collectionData = { 
+      cityName, 
+      totalHits: searchResponse.nbHits, 
+      lat, 
+      lng, 
+      radiusKm,
+      collectionHandle
+    };
+    
+    const staticHTML = generateSSRCollectionHTML(deduplicatedHits, collectionData);
 
     // Cache the result
     const cacheData = {
       data: staticHTML,
       timestamp: Date.now(),
       generated: new Date().toISOString(),
-      products: deduplicatedHits.length,
-      totalHits: searchResponse.nbHits
+      stats: {
+        products: deduplicatedHits.length,
+        totalHits: searchResponse.nbHits,
+        city: cityName,
+        searchTime: searchResponse.processingTimeMS
+      }
     };
 
     cache.set(cacheKey, cacheData);
 
-    console.log(`✅ Static HTML generated for ${cityName}:`, {
+    console.log(`✅ SSR HTML generated for ${cityName}:`, {
       products: deduplicatedHits.length,
       htmlSize: `${Math.round(staticHTML.length / 1024)}KB`,
-      processingTime: `${searchResponse.processingTimeMS}ms`,
-      indexUsed: getIndexName(locale)
+      processingTime: `${searchResponse.processingTimeMS}ms`
     });
 
     res.json({
       html: staticHTML,
       cached: false,
       generated: cacheData.generated,
-      stats: {
-        products: deduplicatedHits.length,
-        totalHits: searchResponse.nbHits,
-        city: cityName,
-        searchTime: searchResponse.processingTimeMS,
-        indexUsed: getIndexName(locale)
-      }
+      stats: cacheData.stats
     });
 
   } catch (error) {
     console.error('❌ Pre-generation error:', error);
     res.status(500).json({
       error: 'Pre-generation failed',
-      message: error.message,
-      indexAttempted: getIndexName(req.body.locale || 'en')
+      message: error.message
     });
   }
 });
@@ -572,7 +653,7 @@ app.post('/api/pre-generate-collection', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Algolia cache server running on port ${PORT}`);
   console.log(`📊 Cache initialized - persistent storage enabled`);
-  console.log(`🌍 Supported indexes:`, ALGOLIA_INDEXES);
+  console.log(`🏗️ SSR pre-rendering enabled for fast LCP`);
 });
 
 module.exports = app;
