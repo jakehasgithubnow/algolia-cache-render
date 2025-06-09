@@ -302,55 +302,75 @@ function deduplicateByLocationPhotoServer(hits, maxResults, maxPerPhoto) {
   return result;
 }
 
+// Helper functions for SSR HTML generation
+function optimizeImageUrl(imageUrl) {
+  if (imageUrl && imageUrl.includes('cdn.shopify.com')) {
+    // Use _400x instead of _600x for better size match to display dimensions
+    return imageUrl.replace(/\.webp(\?.*)?$/i, '_400x.webp$1');
+  }
+  return imageUrl;
+}
+
+function escapeHtml(text) {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatPrice(price) {
+  return new Intl.NumberFormat('de-DE', {
+    style: 'currency',
+    currency: 'EUR',
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0
+  }).format(price);
+}
+
+function formatProductPricing(product) {
+  const printPrice = product.variants_min_price || 7;
+  return `**Drucke ab ${formatPrice(printPrice)}, Originale ab ${formatPrice(50)}**`;
+}
+
 // Generate SSR HTML for fast LCP
 function generateSSRCollectionHTML(products, collectionData) {
   const { cityName, totalHits, lat, lng, radiusKm, collectionHandle } = collectionData;
-  
-  const formatPrice = (price) => {
-    return new Intl.NumberFormat('de-DE', {
-      style: 'currency',
-      currency: 'EUR',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0
-    }).format(price);
-  };
 
-  const escapeHtml = (text) => {
-    return text
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  };
-
-  const optimizeImageUrl = (imageUrl) => {
-    if (imageUrl && imageUrl.includes('cdn.shopify.com')) {
-      // Use _500x instead of _600x for better size match to display dimensions
-      return imageUrl.replace(/\.webp(\?.*)?$/i, '_500x.webp$1');
+  // Generate product cards HTML with FIXED feature card insertion
+  let productsHTML = '';
+  products.forEach((product, index) => {
+    // Insert feature card after the second product (index 2)
+    if (index === 2) {
+      const featureCard = `
+        <div class="masonry-item feature-card-item">
+          <div class="feature-card">
+            <div class="feature-card__content">
+              <div class="feature-card__image">
+                <img src="https://res.cloudinary.com/dyvp677di/image/upload/c_scale,w_512/v1749314053/198534de-dae5-4c81-8861-98222854e0d3.png" alt="Close Canvas founder at art market" loading="lazy" style="width: 100%; height: 100%; object-fit: cover;">
+              </div>
+              <div class="feature-card__text">
+                <h1 class="feature-card__title">Our Online art market</h1>
+                <p class="feature-card__description">You've met us at flea markets & art sales. Now we're bringing affordable art around Germany with our new website.</p>
+                <p class="feature-card__secondary">Look around! We're still featuring amazing unknown artists featuring beautiful and affordable art.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+      productsHTML += featureCard;
     }
-    return imageUrl;
-  };
-
-  const formatProductPricing = (product) => {
-    const printPrice = product.variants_min_price || 7;
-    return `**Drucke ab ${formatPrice(printPrice)}, Originale ab ${formatPrice(50)}**`;
-  };
-
-  // Generate product cards HTML
-  const productsHTML = products.map((product, index) => {
+    
+    // Add the product card
     const originalImageUrl = product.product_image || product.image || '';
     const optimizedImageUrl = optimizeImageUrl(originalImageUrl);
     const priceDisplay = formatProductPricing(product);
     
     // First 2 images should not be lazy loaded for LCP
     const shouldLazyLoad = index >= 2;
-    
-    // Use responsive dimensions that work on all screen sizes
-    const displayWidth = 500; // Reasonable default that fits mobile and desktop
-    const displayHeight = Math.round(displayWidth * 0.75); // 4:3 aspect ratio
 
-    return `
+    productsHTML += `
       <div class="masonry-item" data-location-photo="${product.meta?.location?.details?.location_photo || 'no-photo'}">
         <div class="card-wrapper product-card-wrapper">
           <div class="card card--standard card--media">
@@ -361,8 +381,8 @@ function generateSSRCollectionHTML(products, collectionData) {
                     src="${optimizedImageUrl}" 
                     alt="${escapeHtml(product.title)}" 
                     ${shouldLazyLoad ? 'loading="lazy"' : ''}
-                    width="${displayWidth}"
-                    height="${displayHeight}"
+                    width="400"
+                    height="300"
                     style="width: 100%; height: auto; max-width: 100%; object-fit: cover; display: block;"
                     ${index === 0 ? 'fetchpriority="high"' : ''}
                   >
@@ -377,7 +397,7 @@ function generateSSRCollectionHTML(products, collectionData) {
         </div>
       </div>
     `;
-  }).join('');
+  });
 
   // Complete SSR HTML structure
   return `
@@ -454,7 +474,7 @@ app.post('/api/nearby-search', async (req, res) => {
     });
 
     if (!fallback && (!lat || !lng)) {
-      return res.status(500).json({
+      return res.status(400).json({
         error: 'Missing required parameters: lat, lng (or set fallback: true)'
       });
     }
@@ -541,7 +561,7 @@ app.post('/api/pre-generate-collection', async (req, res) => {
       radiusKm = 30, 
       cityName,
       collectionHandle,
-      hitsPerPage = 6, // Fewer for LCP optimization
+      hitsPerPage = 8, // More products for feature card insertion
       forceRegenerate = false
     } = req.body;
 
