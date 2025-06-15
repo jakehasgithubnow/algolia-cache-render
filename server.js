@@ -306,7 +306,7 @@ function deduplicateByLocationPhotoServer(hits, maxResults, maxPerPhoto) {
 function optimizeImageUrl(imageUrl) {
   if (imageUrl && imageUrl.includes('cdn.shopify.com')) {
     // Use _400x instead of _600x for better size match to display dimensions
-    return imageUrl.replace(/\.webp(\?.*)?$/i, '_400x.webp$1');
+    return imageUrl.replace(/\.webp(\?.*)?$/i, '_600x.webp$1');
   }
   return imageUrl;
 }
