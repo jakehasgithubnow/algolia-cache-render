@@ -376,14 +376,14 @@ function generateSSRCollectionHTML(products, collectionData) {
           <div class="card card--standard card--media">
             <a href="/products/${product.handle}" class="full-unstyled-link">
               ${optimizedImageUrl ? `
-                <div class="card__media" style="aspect-ratio: 4/3;">
+                <div class="card__media">
                   <img 
                     src="${optimizedImageUrl}" 
                     alt="${escapeHtml(product.title)}" 
                     ${shouldLazyLoad ? 'loading="lazy"' : ''}
                     width="400"
                     height="300"
-                    style="width: 100%; height: auto; max-width: 100%; object-fit: cover; display: block;"
+                    style="width: 100%; height: auto; max-width: 100%; display: block; vertical-align: bottom;"
                     ${index === 0 ? 'fetchpriority="high"' : ''}
                   >
                 </div>
